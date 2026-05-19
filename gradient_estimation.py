@@ -212,7 +212,8 @@ def _length_normalized_reward(
     ).squeeze(-1)
     total_logp = (token_logp * shift_mask).sum()
     response_len = shift_mask.sum().clamp_min(1.0)
-    return total_logp / response_len
+    # return total_logp / response_len
+    return total_logp
 
 
 def compute_reward_h_and_grad(
@@ -333,6 +334,8 @@ def validate_example(
     # 2) Remaining m-1 candidates: exact reward + full inputs_embeds.
     r_true_others: List[torch.Tensor] = []
     r_hat_others: List[torch.Tensor] = []
+    rel_distance: List[torch.Tensor] = []
+    nonanchor_response_indices: List[int] = []
     for j in range(1, m):
         ids_t = torch.tensor(candidate_input_ids[j], dtype=torch.long, device=device)
         mask_t = torch.tensor(candidate_response_mask[j], dtype=torch.long, device=device)
@@ -342,26 +345,45 @@ def validate_example(
         r_hat = taylor_estimate(r_anchor, h_anchor, g_anchor, h_j)
         r_true_others.append(r_j)
         r_hat_others.append(r_hat)
-
+        scale = torch.maximum(r_j.abs(), r_hat.abs()) + 1e-12
+        rel_distance.append(((r_hat - r_j) / scale).abs())
+        nonanchor_response_indices.append(j)
     r_true_others = torch.stack(r_true_others)         # [m-1]
     r_hat_others = torch.stack(r_hat_others)           # [m-1]
-
+    rel_distance = torch.stack(rel_distance)           # [m-1]
+    
     # 3 Relative MSE on (length-normalized) reward.
-    sq_err_r = ((r_hat_others - r_true_others) ** 2).mean()
-    denom_r = (r_true_others ** 2).mean().clamp_min(1e-12)
-    rel_mse_reward = (sq_err_r / denom_r).item()
-
+    scale = torch.maximum(r_true_others.abs(), r_hat_others.abs()) + 1e-12
+    rel_mse_reward = ((((r_hat_others - r_true_others) / scale) ** 2).mean()).item()
     r_true_all = torch.cat([r_anchor.unsqueeze(0), r_true_others])
     r_hat_all = torch.cat([r_anchor.unsqueeze(0), r_hat_others])
+    # Backward-compat: keep per-example rel_distance list aligned with full [m]
+    # candidates, where index 0 (anchor) is always 0.0.
+    rel_distance_all = torch.cat(
+        [torch.tensor([0.0], dtype=rel_distance.dtype, device=rel_distance.device), rel_distance]
+    )
+    nonanchor_atoms: List[Dict[str, Any]] = []
+    for atom_idx, response_idx in enumerate(nonanchor_response_indices):
+        scale = torch.maximum(r_true_others[atom_idx].abs(), r_hat_others[atom_idx].abs()) + 1e-12
+        rel_mse_atom = (((r_hat_others[atom_idx] - r_true_others[atom_idx]) / scale) ** 2).item()
+        nonanchor_atoms.append(
+            {
+                "response_index": int(response_idx),
+                "r_true": float(r_true_others[atom_idx].item()),
+                "r_hat": float(r_hat_others[atom_idx].item()),
+                "rel_distance": float(rel_distance[atom_idx].item()),
+                "rel_mse_reward": float(rel_mse_atom),
+                "abs_err": float((r_hat_others[atom_idx] - r_true_others[atom_idx]).abs().item()),
+            }
+        )
 
     return {
         "m": m,
         "r_true": r_true_all.detach().cpu().tolist(),
         "r_hat": r_hat_all.detach().cpu().tolist(),
-        "ce_true": (-r_true_all).detach().cpu().tolist(),
-        "ce_hat": (-r_hat_all).detach().cpu().tolist(),
-        "rel_mse_reward_nonanchor": rel_mse_reward,
-        "abs_err_reward_nonanchor": (r_hat_others - r_true_others).abs().mean().item(),
+        "mean_rel_reward_err": rel_mse_reward,
+        "rel_distance": rel_distance_all.detach().cpu().tolist(),
+        "nonanchor_atoms": nonanchor_atoms,
     }
 
 
@@ -407,10 +429,8 @@ def main() -> None:
     print(f"Evaluating on {len(dataset)} ranking instances. "
           f"(a = 1 anchor = top-ranked, m-1 approximated; length-normalized reward)")
 
-    rel_mse_reward: List[float] = []
-    rel_mse_ce: List[float] = []
-    abs_err_reward: List[float] = []
-    abs_err_ce: List[float] = []
+    rel_distance: List[float] = []
+    nonanchor_atomic_records: List[Dict[str, Any]] = []
     per_example_records: List[Dict[str, Any]] = []
 
     for ex_idx, example in enumerate(tqdm(dataset, desc="Validating Algorithm 1 (a=1)")):
@@ -430,16 +450,23 @@ def main() -> None:
         if not result:
             continue
 
-        rel_mse_reward.append(result["rel_mse_reward_nonanchor"])
-        abs_err_reward.append(result["abs_err_reward_nonanchor"])
+        # Backward-compatible per-example vector includes anchor at index 0.
+        for atom in result.get("nonanchor_atoms", []):
+            nonanchor_atomic_records.append(
+                {
+                    "example_idx": int(ex_idx),
+                    "preference_dimension": example.get("preference_dimension"),
+                    **atom,
+                }
+            )
         per_example_records.append({
             "idx": ex_idx,
             "m": result["m"],
             "preference_dimension": example.get("preference_dimension"),
             "r_true": result["r_true"],
             "r_hat": result["r_hat"],
-            "rel_mse_reward_nonanchor": result["rel_mse_reward_nonanchor"],
-            "abs_err_reward_nonanchor": result["abs_err_reward_nonanchor"],
+            "mean_rel_reward_err": result["mean_rel_reward_err"],
+            "rel_distance": result["rel_distance"]
         })
 
     def _stats(arr: np.ndarray) -> Dict[str, float]:
@@ -451,35 +478,42 @@ def main() -> None:
             "std": float(arr.std()),
         }
 
-    rel_r_arr = np.array(rel_mse_reward, dtype=np.float64)
-    rel_ce_arr = np.array(rel_mse_ce, dtype=np.float64)
-    abs_r_arr = np.array(abs_err_reward, dtype=np.float64)
-    abs_ce_arr = np.array(abs_err_ce, dtype=np.float64)
+    rel_distance_arr = np.array(rel_distance, dtype=np.float64)
+    atomic_rel_dist = np.array([row["rel_distance"] for row in nonanchor_atomic_records], dtype=np.float64)
+    atomic_rel_mse = np.array([row["rel_mse_reward"] for row in nonanchor_atomic_records], dtype=np.float64)
+
+    distance_bin_edges = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, float("inf")]
+    distance_buckets: Dict[str, Dict[str, float]] = {}
+    for lo, hi in zip(distance_bin_edges[:-1], distance_bin_edges[1:]):
+        if np.isinf(hi):
+            key = f"[{lo:.2f}, +inf)"
+            mask = atomic_rel_dist >= lo
+        else:
+            key = f"[{lo:.2f}, {hi:.2f})"
+            mask = (atomic_rel_dist >= lo) & (atomic_rel_dist < hi)
+        bucket_dist = atomic_rel_dist[mask]
+        bucket_rel_mse = atomic_rel_mse[mask]
+        distance_buckets[key] = {
+            "count": int(bucket_dist.size),
+            "mean_rel_distance": float(bucket_dist.mean()) if bucket_dist.size > 0 else 0.0,
+            "mean_rel_mse_reward": float(bucket_rel_mse.mean()) if bucket_rel_mse.size > 0 else 0.0,
+            "var_rel_mse_reward": float(bucket_rel_mse.var()) if bucket_rel_mse.size > 0 else 0.0,
+        }
 
     summary = {
-        "n_examples": int(rel_r_arr.size),
-        "rel_mse_reward_nonanchor": _stats(rel_r_arr),
-        "rel_mse_ce_nonanchor": _stats(rel_ce_arr),
-        "abs_err_reward_nonanchor": _stats(abs_r_arr),
-        "abs_err_ce_nonanchor": _stats(abs_ce_arr),
+        "n_atomic_nonanchor": int(atomic_rel_dist.size),
+        "distance_buckets": distance_buckets,
     }
 
     print("\n=== Taylor approximation with a=1 anchor (top-ranked), length-normalized reward ===")
-    print(f"#examples : {summary['n_examples']}")
-    print("\nRelative MSE on REWARD (length-normalized log-prob) over non-anchor candidates:")
-    print(f"  mean   : {summary['rel_mse_reward_nonanchor']['mean']:.6f}")
-    print(f"  median : {summary['rel_mse_reward_nonanchor']['median']:.6f}")
-    print(f"  std    : {summary['rel_mse_reward_nonanchor']['std']:.6f}")
-    print("\nRelative MSE on CROSS-ENTROPY LOSS (= -reward) over non-anchor candidates:")
-    print(f"  mean   : {summary['rel_mse_ce_nonanchor']['mean']:.6f}")
-    print(f"  median : {summary['rel_mse_ce_nonanchor']['median']:.6f}")
-    print(f"  std    : {summary['rel_mse_ce_nonanchor']['std']:.6f}")
-    print("\nMean absolute error on REWARD:")
-    print(f"  mean   : {summary['abs_err_reward_nonanchor']['mean']:.6f}")
-    print(f"  median : {summary['abs_err_reward_nonanchor']['median']:.6f}")
-    print("\nMean absolute error on CROSS-ENTROPY LOSS:")
-    print(f"  mean   : {summary['abs_err_ce_nonanchor']['mean']:.6f}")
-    print(f"  median : {summary['abs_err_ce_nonanchor']['median']:.6f}")
+    print("Distance bucket stats:")
+    for bucket, stats in summary["distance_buckets"].items():
+        print(
+            f"  {bucket:>16}  count={stats['count']:>6}  "
+            f"mean_rel_distance={stats['mean_rel_distance']:.6f}  "
+            f"mean_rel_mse_reward={stats['mean_rel_mse_reward']:.6f}  "
+            f"var_rel_mse_reward={stats['var_rel_mse_reward']:.6f}"
+        )
 
     payload = {
         "base_model": args.base_model,
@@ -489,6 +523,7 @@ def main() -> None:
         "anchor_strategy": "top_ranked",
         "reward_definition": "length_normalized_log_prob",
         "summary": summary,
+        "atomic_nonanchor_records": nonanchor_atomic_records,
         "examples": per_example_records,
     }
     with open(args.output_json, "w") as f:
