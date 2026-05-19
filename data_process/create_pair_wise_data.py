@@ -2,11 +2,135 @@ import pandas as pd
 from datasets import load_dataset
 from tqdm import tqdm
 import pickle
-from datasets import Dataset, DatasetDict
+from pathlib import Path
+from datasets import Dataset, DatasetDict, concatenate_datasets
 from datasets import load_from_disk
 from huggingface_hub import login
 from eval.criteria import REWARDBENCH_CONTEXT_MAP
 # login()
+
+
+def _extract_ultra_score(candidate: dict, attribute: str):
+    """Best-effort extraction of UltraFeedback attribute score from completion-level metadata."""
+    base_attr = attribute.replace("ultrafeedback-", "")
+    base_attr_us = base_attr.replace("-", "_")
+
+    def _to_float(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        if isinstance(value, dict):
+            # Common UltraFeedback schema: annotations[dimension]["Rating"]
+            for key in ("Rating", "rating", "score", "Score", "value"):
+                if key in value:
+                    parsed = _to_float(value[key])
+                    if parsed is not None:
+                        return parsed
+        return None
+
+    score_containers = [
+        candidate.get("annotations"),
+        candidate.get("scores"),
+        candidate.get("score"),
+        candidate.get("fine-grained_score"),
+    ]
+    lookup_keys = [
+        base_attr,
+        base_attr_us,
+        attribute,
+        attribute.replace("-", "_"),
+    ]
+    for container in score_containers:
+        if isinstance(container, dict):
+            for key in lookup_keys:
+                if key in container:
+                    parsed = _to_float(container[key])
+                    if parsed is not None:
+                        return parsed
+    # Some variants store raw top-level fields on each candidate row
+    for key in lookup_keys:
+        if key in candidate:
+            parsed = _to_float(candidate[key])
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _load_or_build_ultrafeedback_original_content(dataset_path: str):
+    cache_path = Path("./dataset/ultrafeedback_original_content.pkl")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if cache_path.exists():
+        with open(cache_path, "rb") as file:
+            return pickle.load(file)
+
+    print(f"[Info] {cache_path} not found, building from {dataset_path} ...")
+    # Use a writable local cache to avoid permission issues with system-level HF cache locks.
+    local_cache = "./.hf_datasets_cache"
+    try:
+        ds = load_dataset(dataset_path, split="train", cache_dir=local_cache)
+    except Exception as e:
+        print(f"[Warn] load_dataset failed ({type(e).__name__}: {e}). Trying local cached arrow shards...")
+        local_root = Path(local_cache)
+        home_root = Path.home() / ".cache" / "huggingface" / "datasets"
+        shard_paths = sorted(local_root.glob("openbmb___ultra_feedback/default/0.0.0/*/ultra_feedback-train-*.arrow"))
+        if not shard_paths:
+            shard_paths = sorted(home_root.glob("openbmb___ultra_feedback/default/0.0.0/*/ultra_feedback-train-*.arrow"))
+        if not shard_paths:
+            raise FileNotFoundError(
+                "Could not load UltraFeedback from hub and no local arrow shards found in "
+                f"{local_root} or {home_root}."
+            ) from e
+        shards = [Dataset.from_file(str(path)) for path in shard_paths]
+        ds = shards[0] if len(shards) == 1 else concatenate_datasets(shards)
+    attributes = [
+        "ultrafeedback-helpfulness",
+        "ultrafeedback-honesty",
+        "ultrafeedback-instruction-following",
+        "ultrafeedback-truthfulness",
+    ]
+    rows = []
+    for item in tqdm(ds, desc="Building ultrafeedback_original_content"):
+        prompt = item.get("prompt") or item.get("instruction")
+        source = item.get("source", "unknown")
+        completions = item.get("completions")
+        if not isinstance(completions, list):
+            continue
+        for cand in completions:
+            if not isinstance(cand, dict):
+                continue
+            content = cand.get("content") or cand.get("response") or cand.get("text")
+            if not isinstance(content, str):
+                continue
+            row = {"prompt": prompt, "source": source, "content": content}
+            valid = True
+            for attr in attributes:
+                value = _extract_ultra_score(cand, attr)
+                if value is None:
+                    valid = False
+                    break
+                row[attr] = value
+            if valid:
+                rows.append(row)
+
+    if not rows:
+        raise ValueError(
+            "Failed to build ultrafeedback rows from dataset. "
+            "Schema might differ from expected UltraFeedback format."
+        )
+
+    with open(cache_path, "wb") as file:
+        pickle.dump(rows, file)
+    print(f"[Info] Wrote {len(rows)} rows to {cache_path}")
+    return rows
 
 def create_pairwise_dataset_per_attribute_helpsteer2(dataset_path):
     ds1 = load_dataset(dataset_path)['train'].shuffle(seed=0)
@@ -104,9 +228,7 @@ def create_pairwise_dataset_per_attribute_helpsteer2(dataset_path):
     return pairwise_df_train, pairwise_df_test
 
 def create_pairwise_dataset_per_attribute_ultra(dataset_path):
-
-    with open('./dataset/ultrafeedback_original_content.pkl','rb') as file:
-        ds1 = pickle.load(file)
+    ds1 = _load_or_build_ultrafeedback_original_content(dataset_path)
 
     df = pd.DataFrame(ds1).reset_index().rename(columns={'index': 'original_index'})
     
@@ -529,8 +651,7 @@ def create_pairwise_dataset_shp_alignment():
 
     dataset.save_to_disk("./dataset/stanford_shp_pairwise")
     
-create_pairwise_dataset_shp_alignment()
-    
+# create_pairwise_dataset_shp_alignment()
 
 # pairwise_df_train, pairwise_df_test =  create_pairwise_dataset_per_attribute_helpsteer2('nvidia/Helpsteer2')
 # pairwise_df_train.to_csv('./dataset/helpsteer2_pairwise_train_per_attribute_version3.csv', index=False, encoding='utf-8-sig')
@@ -550,9 +671,9 @@ create_pairwise_dataset_shp_alignment()
 # pairwise_df_train.to_csv('./dataset/rpr_per_category_pairwise_add_criterion.csv', index=False, encoding='utf-8-sig')
 # pairwise_df_test.to_csv('./dataset/rpr_per_category_pairwise_add_criterion.csv', index=False, encoding='utf-8-sig')
 
-# pairwise_df_train, pairwise_df_test = create_pairwise_dataset_rpr(add_criterion = False)
-# pairwise_df_train.to_csv('./dataset/rpr_per_category_pairwise.csv', index=False, encoding='utf-8-sig')
-# pairwise_df_test.to_csv('./dataset/rpr_per_category_pairwise.csv', index=False, encoding='utf-8-sig')
+pairwise_df_train, pairwise_df_test = create_pairwise_dataset_rpr(add_criterion = False)
+pairwise_df_train.to_csv('./dataset/rpr_per_category_pairwise.csv', index=False, encoding='utf-8-sig')
+pairwise_df_test.to_csv('./dataset/rpr_per_category_pairwise.csv', index=False, encoding='utf-8-sig')
 
 # create_pairwise_dataset_rlhf_hh()
 # create_pairwise_dataset_700K()
